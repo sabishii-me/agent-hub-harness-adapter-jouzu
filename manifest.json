@@ -1,10 +1,11 @@
 {
   "id": "jouzu",
+  "kind": "harness-adapter",
   "icons": {
     "light": "logo.png",
     "dark": "logo.png"
   },
-  "version": "0.1.4",
+  "version": "0.1.5",
   "protocol": 0,
   "command": [
     "node",
