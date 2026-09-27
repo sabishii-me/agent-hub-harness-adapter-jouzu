@@ -1,0 +1,14 @@
+{
+  "package": "jouzu",
+  "version": "0.1.13",
+  "target": "runtime",
+  "strip": 1,
+  "recordedFrom": "pnpm install --lockfile-only (release machine)",
+  "sources": [
+    {
+      "url": "https://registry.npmjs.org/jouzu/-/jouzu-0.1.13.tgz",
+      "integrity": "sha512-ulabdOtuLF7P1wuBY8IaIiTNXOayjpsUy127F5/3QocBWRgCuZoAqy/Qg9ynKByRdkWgooSPiRNlJelYOIhU8A==",
+      "path": ""
+    }
+  ]
+}
