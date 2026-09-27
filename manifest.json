@@ -1,5 +1,10 @@
 {
   "id": "jouzu",
+  "icons": {
+    "light": "logo.png",
+    "dark": "logo.png"
+  },
+  "version": "0.1.4",
   "protocol": 0,
   "command": [
     "node",
@@ -7,7 +12,7 @@
   ],
   "runtime": {
     "package": "jouzu",
-    "version": "0.1.10",
+    "version": "0.1.13",
     "command": [
       "node",
       "runtime/dist/cli.js"
@@ -19,6 +24,7 @@
   ],
   "capabilities": [
     "models",
+    "providers",
     "runtime",
     "presets",
     "plan",
@@ -27,6 +33,7 @@
     "stats",
     "compact",
     "rename",
-    "skills"
+    "skills",
+    "history-readonly"
   ]
 }
