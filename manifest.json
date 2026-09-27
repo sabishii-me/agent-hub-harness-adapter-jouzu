@@ -1,6 +1,10 @@
 {
   "id": "jouzu",
-  "version": "0.1.3",
+  "icons": {
+    "light": "logo.png",
+    "dark": "logo.png"
+  },
+  "version": "0.1.4",
   "protocol": 0,
   "command": [
     "node",
