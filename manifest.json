@@ -4,7 +4,7 @@
     "light": "logo.png",
     "dark": "logo.png"
   },
-  "version": "0.1.6",
+  "version": "0.1.7",
   "protocol": 0,
   "command": [
     "node",
@@ -36,5 +36,10 @@
     "skills",
     "history-readonly"
   ],
-  "pluginType": "harness-adapter"
+  "pluginType": "harness-adapter",
+  "name": "Jouzu",
+  "summary": "pi-compatible harness driving the jouzu runtime.",
+  "release": {
+    "repository": "sabishii-me/agent-hub-harness-adapter-jouzu"
+  }
 }
