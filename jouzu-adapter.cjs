@@ -557,7 +557,9 @@ function thinkingLevelMapFor(decl) {
 }
 
 function applyInjectedProvider(dir, modelIds) {
-  const p = path.join(dir, 'agent', 'models.json');
+  const agentDir = path.join(dir, 'agent');
+  fs.mkdirSync(agentDir, { recursive: true });
+  const p = path.join(agentDir, 'models.json');
   const cfg = readJsonFile(p) || {};
   cfg.providers = cfg.providers || {};
   const pid = INJECT_PREFIX + String(granted.connectionId || 'provider');
@@ -581,11 +583,44 @@ function applyInjectedProvider(dir, modelIds) {
   fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
 }
 
+// The hub-owned jouzu profile must be applied ONCE, before sessions start. jouzu
+// re-runs the apply on EVERY launch; when several sessions of one harness start at
+// the same instant, they race the same `profile.lock`, and the losers exit 1
+// ("another profile operation is in progress") - a harness must serve many sessions
+// at once (docs/issues/20261005-030000). So apply it ONCE here, before the first
+// spawn, and let every launch find it converged (a converged apply takes no lock).
+// A bounded retry covers the case where another launch is mid-apply right now.
+function ensureProfileApplied() {
+  if (profileApplied) return;
+  profileApplied = true;   // once per adapter process
+  const r = piRuntime || resolvePi();
+  const argv = [r.cmd, ...r.args, 'profile', 'apply'];   // e.g. [node, .../dist/cli.js, profile, apply]
+  const t0 = Date.now();
+  for (;;) {
+    const p = spawnSync(argv[0], argv.slice(1), {
+      windowsHide: true, encoding: 'utf8',
+      env: { ...process.env },   // carries JOUZU_HOME
+    });
+    const out = (p.stdout || '') + String.fromCharCode(10) + (p.stderr || '');
+    // Converged (or applied) is success; a busy lock is retried briefly.
+    if (p.status === 0 || /already converged|Applied transaction/i.test(out)) return;
+    if (/another profile operation is in progress/i.test(out) && Date.now() - t0 < 15000) {
+      continue;
+    }
+    // Never block a start on this: log and let the launch proceed (it will apply
+    // itself, which is the old behaviour).
+    process.stderr.write('[jouzu-adapter] profile apply did not converge: ' + out.trim().slice(0, 300) + String.fromCharCode(10));
+    return;
+  }
+}
+let profileApplied = false;
+
 function startPi(resumeRef) {
   if (!SESSIONS_DIR) {
     die('AGENT_HUB_HARNESS_DIR not set: the core must provide a data dir; refusing to write runtime data next to plugin code');
   }
   fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+  ensureProfileApplied();
   const ref = resumeRef || path.join(SESSIONS_DIR, `session-${Date.now()}-${process.pid}.jsonl`);
   // The harness initializes an explicitly supplied empty file with its own
   // valid header and persists subsequent entries even before a model turn.
