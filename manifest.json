@@ -4,7 +4,7 @@
     "light": "logo.png",
     "dark": "logo.png"
   },
-  "version": "0.1.10",
+  "version": "0.1.11",
   "protocol": 0,
   "command": [
     "node",
