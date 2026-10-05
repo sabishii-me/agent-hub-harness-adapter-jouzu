@@ -36,13 +36,11 @@ const { pathToFileURL } = require('node:url');
 const PLUGIN_DIR = __dirname;
 
 // The hub gives ONE directory per harness (<DATA_DIR>/agents/<harness>, handed over
-// as AGENT_HUB_HARNESS_DIR). That IS the harness's home: every session of this
-// harness shares it. jouzu's root is its own `JOUZU_HOME`; point it at that one dir
-// so all sessions share one state/config (the hub-owned copy, never the user's real
-// config). Do NOT invent extra homes per session or per injection - one harness,
-// one home.
+// as AGENT_HUB_HARNESS_DIR). Inside it, jouzu's root is ONE stable subdir shared by
+// every session of this harness (the hub-owned copy, never the user's real config).
+// One harness -> one home; never a new home per session or per injection.
 if (process.env.AGENT_HUB_HARNESS_DIR) {
-  process.env.JOUZU_HOME = process.env.AGENT_HUB_HARNESS_DIR;
+  process.env.JOUZU_HOME = path.join(process.env.AGENT_HUB_HARNESS_DIR, 'jouzu-home');
 }
 
 
