@@ -388,30 +388,61 @@ function planCommand(active, cb) {
 // because the harness was still booting would be wrong.
 function reviewCommand(on, cb) {
   // A missing extension command must never fall through to a provider prompt.
+  //
+  // pi ACCEPTING the prompt is not the switch taking effect: the extension runs the
+  // command on its own turn and only then appends `hub-review/state`. The switch is
+  // only REAL once a NEW state entry records the requested value - reading the newest
+  // entry right after acceptance can see an EARLIER one (e.g. a previous `true`) and
+  // report `applied:true` while the live gate is still off, so the next turn runs
+  // unapproved (20261004-070000). So: count the state entries BEFORE the command, then
+  // wait until a NEWER entry exists AND records the requested value. Bounded - a switch
+  // that never lands is reported as not recorded, never as applied.
+  const REQUESTED = on === true;
+  const TIMEOUT_MS = 5000;
+  const POLL_MS = 100;
   harnessUpProof(120000)
     .then(() => piRequest({ type: 'get_commands' }))
     .then((r) => {
       const commands = r && r.success === true && Array.isArray(r.data?.commands) ? r.data.commands : [];
       if (!commands.some((c) => c.name === 'review')) throw new Error('review extension is not loaded');
-      return piRequest({ type: 'prompt', message: on ? '/review on' : '/review off' });
-    })
-    .then((r) => {
-      if (!r || r.success !== true) throw new Error('review command was rejected');
-      readReviewState((state) => typeof state === 'boolean' ? cb(state) : cb(null, new Error('review state was not recorded')));
+      // Baseline BEFORE the command: how many hub-review/state entries exist now.
+      return readReviewStateIndex((before) => {
+        piRequest({ type: 'prompt', message: on ? '/review on' : '/review off' })
+          .then((resp) => {
+            if (!resp || resp.success !== true) throw new Error('review command was rejected');
+            const deadline = Date.now() + TIMEOUT_MS;
+            const waitForNew = () => {
+              readReviewState((state, index) => {
+                // Only a NEWER entry can prove the command took effect.
+                if (index > before && state === REQUESTED) { cb(state); return; }
+                if (Date.now() >= deadline) { cb(index > before ? state : null); return; }
+                setTimeout(waitForNew, POLL_MS);
+              });
+            };
+            waitForNew();
+          })
+          .catch((error) => cb(null, error));
+        });
     })
     .catch((error) => cb(null, error));
 }
 
 
 function readReviewState(cb) {
-  if (!pi) { cb(null); return; }
+  if (!pi) { cb(null, 0); return; }
   piRequest({ type: 'get_entries' })
     .then((r) => {
       const entries = (r && r.data && Array.isArray(r.data.entries)) ? r.data.entries : [];
-      const last = entries.filter((e) => e && e.customType === 'hub-review/state').pop();
-      cb(last && last.data && typeof last.data.asking === 'boolean' ? last.data.asking : null);
+      const states = entries.filter((e) => e && e.customType === 'hub-review/state');
+      const last = states[states.length - 1];
+      cb(last && last.data && typeof last.data.asking === 'boolean' ? last.data.asking : null, states.length);
     })
-    .catch(() => cb(null));
+    .catch(() => cb(null, 0));
+}
+
+// The number of hub-review/state entries right now (the pre-command baseline).
+function readReviewStateIndex(cb) {
+  readReviewState((_state, index) => cb(index));
 }
 
 function readPlanState(cb) {
@@ -1222,7 +1253,12 @@ function handleBusMessage(msg) {
           const planEntry = entries.filter(e => e.customType === 'plan/mode').at(-1);
           const reviewEntry = entries.filter(e => e.customType === 'hub-review/state').at(-1);
           if (typeof planEntry?.data?.active === 'boolean') applied.plan = planEntry.data.active;
-          if (typeof reviewEntry?.data?.asking === 'boolean') applied.review = reviewEntry.data.asking;
+          // Only take the LOG's value when this request did not ask to change review.
+          // When it did, `reviewCommand` already OBSERVED the switch take effect (a NEW
+          // state entry); clobbering it here with `.at(-1)` would re-introduce the race
+          // this whole path exists to close (20261004-070000: a log record read as the
+          // live gate).
+          if (review === undefined && typeof reviewEntry?.data?.asking === 'boolean') applied.review = reviewEntry.data.asking;
           reply({ jsonrpc: '2.0', id, result: { applied, requires: 'none' } });
         }).catch(error => reply({ jsonrpc: '2.0', id, error: { code: -32000, message: error.message } }));
       };
