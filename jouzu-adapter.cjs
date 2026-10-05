@@ -35,10 +35,14 @@ const { pathToFileURL } = require('node:url');
 // happened to spawn the adapter from.
 const PLUGIN_DIR = __dirname;
 
-// Managed instances never borrow the terminal's native configuration home.
-// Apply once so catalogue, authentication and all child processes agree.
+// The hub gives ONE directory per harness (<DATA_DIR>/agents/<harness>, handed over
+// as AGENT_HUB_HARNESS_DIR). That IS the harness's home: every session of this
+// harness shares it. jouzu's root is its own `JOUZU_HOME`; point it at that one dir
+// so all sessions share one state/config (the hub-owned copy, never the user's real
+// config). Do NOT invent extra homes per session or per injection - one harness,
+// one home.
 if (process.env.AGENT_HUB_HARNESS_DIR) {
-  process.env.JOUZU_HOME = path.join(process.env.AGENT_HUB_HARNESS_DIR, 'jouzu-home');
+  process.env.JOUZU_HOME = process.env.AGENT_HUB_HARNESS_DIR;
 }
 
 
@@ -532,23 +536,15 @@ function probeModels(url, value, api) {
   });
 }
 
-// Build a private JOUZU_HOME carrying the user's own agent config forward plus
-// the injected provider. jouzu owns PI_CODING_AGENT_DIR: `configurePiProcess`
-// overwrites it with `paths.agentDir` on every start, so an adapter that sets it
-// is silently ignored and the harness runs on its native providers. The only
-// lever jouzu honours is its own root (`JOUZU_HOME` / `--jouzu-home`), whose
-// agent dir IS `paths.agentDir` (docs/windows.md, paths.ts).
+// The hub-managed provider is injected into jouzu's ONE root - the harness dir the
+// hub gave us (AGENT_HUB_HARNESS_DIR), which every session of this harness shares.
+// jouzu owns PI_CODING_AGENT_DIR: `configurePiProcess` overwrites it from its own
+// root on every start, so the only lever is that root itself, whose agent dir IS
+// `paths.agentDir` (docs/windows.md, paths.ts). The provider goes into ITS
+// agent/models.json - the hub-owned harness dir, so the user's real files are never
+// touched.
 function buildInjectedDir() {
-  const base = jouzuAgentDir();
-  const root = path.join(SESSIONS_DIR, 'injected-' + (granted.connectionId || 'provider').replace(/[^A-Za-z0-9_.-]/g, '_'));
-  const dir = path.join(root, 'agent');
-  fs.mkdirSync(dir, { recursive: true });
-  // Carry the user's own config forward, verbatim; never mutate the originals.
-  for (const f of ['models.json', 'auth.json', 'models-store.json', 'settings.json']) {
-    const src = path.join(base, f);
-    if (fs.existsSync(src)) fs.copyFileSync(src, path.join(dir, f));
-  }
-  return root;
+  return process.env.JOUZU_HOME;
 }
 
 // Add the injected provider into the private AGENT dir's models.json. apiKey is
@@ -622,15 +618,13 @@ function startPi(resumeRef) {
   if (activePresetId !== null) {
     env.AGENT_PRESETS_CONFIG = writeActivePreset(activePresetId);
   }
-  // J-2: inject the hub-managed provider by giving jouzu a private JOUZU_HOME.
-  // jouzu rewrites PI_CODING_AGENT_DIR from its own root on start, so the
-  // injected models.json only takes effect through JOUZU_HOME. The token rides
-  // in the env; the models.json entry references it as ${ENV}.
+  // J-2: inject the hub-managed provider into the harness's ONE root (its
+  // agent/models.json). The token rides in the env; the models.json entry
+  // references it as ${ENV}. No extra home is created.
   if (granted && granted.url && granted.value) {
     if (!injectedEnvName) injectedEnvName = 'AGENT_HUB_INJECTED_' + String(granted.connectionId || 'PROVIDER').replace(/[^A-Za-z0-9]/g, '_').toUpperCase() + '_API_KEY';
     env[injectedEnvName] = granted.value;
     injectedDir = injectedDir || buildInjectedDir();
-    env.JOUZU_HOME = injectedDir;
   }
   // Run jouzu in the user project dir (AGENT_HUB_CWD) so tools act on the project.
   const cwd = process.env.AGENT_HUB_CWD || undefined;
