@@ -906,7 +906,7 @@ function handlePiMessage(msg) {
     terminalSent = true;
     lastStopReason = undefined;
     turnsRun += 1;
-    send({ jsonrpc: '2.0', method: 'event', params: { sid, data: { type: 'turn_end', status } } });
+    send({ jsonrpc: '2.0', method: 'event', params: { sid, data: { type: 'turn_end', clientMessageId: currentClientMessageId, state: status === 'completed' ? 'ok' : status, status } } });
     // The plan extension can change plan mode on its own — the model leaves
     // plan mode when its plan is approved. Read the state back and report the
     // change, so the core's view follows the harness rather than the last thing
@@ -952,6 +952,12 @@ let abortRequested = false;
 let terminalSent = false; // true once we reported a terminal turn_end for the current turn
 let turnActive = false;  // true from prompt start until we report a terminal
 let lastStopReason;     // last turn_end stopReason seen in the active turn
+// The clientMessageId (the core's turn id) of the turn in flight. The core binds a
+// turn's terminal by THIS id on the `turn_end` event, so every turn_end must echo it
+// (the core's pump matches on `clientMessageId`; without it the terminal is never
+// bound and the turn settles `failed` on the core's timeout - the pi adapter sends
+// it, so jouzu must too).
+let currentClientMessageId;
 
 // How many turns this session has produced. A preset is a session composition
 // — swapping tools under a conversation leaves logged tool calls the new
@@ -1105,11 +1111,13 @@ function handleBusMessage(msg) {
           const response = await piRequest({ type: 'prompt', message: params.message });
           if (!response?.success) throw new Error(JSON.stringify(response?.error ?? 'native control failed'));
           // Completion means the control handler returned, not that a model ran.
-          send({ jsonrpc: '2.0', method: 'event', params: { sid, data: { type: 'turn_end', status: 'ok' } } });
+          send({ jsonrpc: '2.0', method: 'event', params: { sid, data: { type: 'turn_end', clientMessageId: params.clientMessageId, state: 'ok', status: 'ok' } } });
           send({ jsonrpc: '2.0', id, result: {} });
         })().catch(error => send({ jsonrpc: '2.0', id, error: { code: -32000, message: error.message } }));
         return;
       }
+      // This turn's id: echoed on its terminal turn_end so the core can bind it.
+      currentClientMessageId = params.clientMessageId;
       appendTranscript({ id: params.clientMessageId, role: 'user', source: params.source || 'user', text: params.message, complete: true });
       // Do NOT arm the new turn yet: a stale turn_end from a just-aborted turn
       // can still arrive. pi cannot emit the new turn's turn_end before it
