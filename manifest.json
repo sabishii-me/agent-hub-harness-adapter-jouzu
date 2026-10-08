@@ -4,7 +4,7 @@
     "light": "logo.png",
     "dark": "logo.png"
   },
-  "version": "0.1.8",
+  "version": "0.1.11",
   "protocol": 0,
   "command": [
     "node",
@@ -12,7 +12,7 @@
   ],
   "runtime": {
     "package": "jouzu",
-    "version": "0.1.13",
+    "version": "0.1.18",
     "command": [
       "node",
       "runtime/dist/cli.js"

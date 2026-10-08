@@ -35,8 +35,10 @@ const { pathToFileURL } = require('node:url');
 // happened to spawn the adapter from.
 const PLUGIN_DIR = __dirname;
 
-// Managed instances never borrow the terminal's native configuration home.
-// Apply once so catalogue, authentication and all child processes agree.
+// The hub gives ONE directory per harness (<DATA_DIR>/agents/<harness>, handed over
+// as AGENT_HUB_HARNESS_DIR). Inside it, jouzu's root is ONE stable subdir shared by
+// every session of this harness (the hub-owned copy, never the user's real config).
+// One harness -> one home; never a new home per session or per injection.
 if (process.env.AGENT_HUB_HARNESS_DIR) {
   process.env.JOUZU_HOME = path.join(process.env.AGENT_HUB_HARNESS_DIR, 'jouzu-home');
 }
@@ -315,22 +317,15 @@ const ADDITIONAL_DIRS = JSON.parse(process.env.AGENT_HUB_ADDITIONAL_DIRS || '[]'
 // Which directory name an extension takes in the workspace is the harness's own
 // rule, so that mapping lives here.
 const INSTALLED_EXT_DIR = process.env.AGENT_HUB_INSTALLED_EXTENSIONS_DIR || null;
-const EXT_DEST = { 'agent-presets': 'agent-presets', plan: 'hub-plan' };
-function copyTree(src, dst) {
-  fs.mkdirSync(dst, { recursive: true });
-  for (const name of fs.readdirSync(src)) {
-    const from = path.join(src, name);
-    const to = path.join(dst, name);
-    if (fs.statSync(from).isDirectory()) copyTree(from, to);
-    else fs.copyFileSync(from, to);
-  }
-}
-function placeExtension(id, cwd) {
-  const dest = EXT_DEST[id];
+// The hub installed this harness's extensions into a hub-owned snapshot dir and
+// handed it over as AGENT_HUB_INSTALLED_EXTENSIONS_DIR. The adapter does NOT copy
+// them into the user's workspace: it POINTS the harness at the hub-owned dir with
+// discovery OFF (jouzu is pi-based: --no-extensions --extension <dir>), exactly as
+// it already does for skills (--no-skills --skill <dir>). Placement is the hub's;
+// this only resolves WHERE the harness reads it from.
+function extensionDirFor(id) {
   const src = INSTALLED_EXT_DIR ? path.join(INSTALLED_EXT_DIR, id) : null;
-  if (!src || !dest || !cwd || !fs.existsSync(src)) return false;
-  copyTree(src, path.join(cwd, '.pi', 'extensions', dest));
-  return true;
+  return src && fs.existsSync(src) ? src : null;
 }
 let activePresetId = null;
 let planActive = null;    // the plan state this adapter last reported (null = not yet known)
@@ -347,17 +342,12 @@ function listShippedPresets() {
   }
   return out;
 }
-// The hub installed agent-presets for this harness; put it where jouzu looks.
-// Not installed = not placed, which is how removing it from the registry takes
-// effect.
-function installAgentPresetsExt(cwd) { return placeExtension('agent-presets', cwd); }
 // --- plan mode (session-scoped capability) -----------------------------------
-// jouzu has no native plan mode, so the hub ships one as an extension and
-// installs it into the workspace for the session. The adapter drives it the same
-// way a user would — the `/plan` command — and reads the state back from the
-// session log the extension writes, so nothing here needs a private side
+// jouzu has no native plan mode, so the hub ships one as an extension; the adapter
+// loads it from the hub-owned dir at spawn (--extension). It drives the extension
+// the same way a user would — the `/plan` command — and reads the state back from
+// the session log the extension writes, so nothing here needs a private side
 // channel.
-function installPlanExt(cwd) { return placeExtension('plan', cwd); }
 
 // Drive the plan command over pi's rpc. An extension command runs through
 // `prompt` (it is not queued, and it produces no model turn of its own), which
@@ -388,30 +378,61 @@ function planCommand(active, cb) {
 // because the harness was still booting would be wrong.
 function reviewCommand(on, cb) {
   // A missing extension command must never fall through to a provider prompt.
+  //
+  // pi ACCEPTING the prompt is not the switch taking effect: the extension runs the
+  // command on its own turn and only then appends `hub-review/state`. The switch is
+  // only REAL once a NEW state entry records the requested value - reading the newest
+  // entry right after acceptance can see an EARLIER one (e.g. a previous `true`) and
+  // report `applied:true` while the live gate is still off, so the next turn runs
+  // unapproved (20261004-070000). So: count the state entries BEFORE the command, then
+  // wait until a NEWER entry exists AND records the requested value. Bounded - a switch
+  // that never lands is reported as not recorded, never as applied.
+  const REQUESTED = on === true;
+  const TIMEOUT_MS = 5000;
+  const POLL_MS = 100;
   harnessUpProof(120000)
     .then(() => piRequest({ type: 'get_commands' }))
     .then((r) => {
       const commands = r && r.success === true && Array.isArray(r.data?.commands) ? r.data.commands : [];
       if (!commands.some((c) => c.name === 'review')) throw new Error('review extension is not loaded');
-      return piRequest({ type: 'prompt', message: on ? '/review on' : '/review off' });
-    })
-    .then((r) => {
-      if (!r || r.success !== true) throw new Error('review command was rejected');
-      readReviewState((state) => typeof state === 'boolean' ? cb(state) : cb(null, new Error('review state was not recorded')));
+      // Baseline BEFORE the command: how many hub-review/state entries exist now.
+      return readReviewStateIndex((before) => {
+        piRequest({ type: 'prompt', message: on ? '/review on' : '/review off' })
+          .then((resp) => {
+            if (!resp || resp.success !== true) throw new Error('review command was rejected');
+            const deadline = Date.now() + TIMEOUT_MS;
+            const waitForNew = () => {
+              readReviewState((state, index) => {
+                // Only a NEWER entry can prove the command took effect.
+                if (index > before && state === REQUESTED) { cb(state); return; }
+                if (Date.now() >= deadline) { cb(index > before ? state : null); return; }
+                setTimeout(waitForNew, POLL_MS);
+              });
+            };
+            waitForNew();
+          })
+          .catch((error) => cb(null, error));
+        });
     })
     .catch((error) => cb(null, error));
 }
 
 
 function readReviewState(cb) {
-  if (!pi) { cb(null); return; }
+  if (!pi) { cb(null, 0); return; }
   piRequest({ type: 'get_entries' })
     .then((r) => {
       const entries = (r && r.data && Array.isArray(r.data.entries)) ? r.data.entries : [];
-      const last = entries.filter((e) => e && e.customType === 'hub-review/state').pop();
-      cb(last && last.data && typeof last.data.asking === 'boolean' ? last.data.asking : null);
+      const states = entries.filter((e) => e && e.customType === 'hub-review/state');
+      const last = states[states.length - 1];
+      cb(last && last.data && typeof last.data.asking === 'boolean' ? last.data.asking : null, states.length);
     })
-    .catch(() => cb(null));
+    .catch(() => cb(null, 0));
+}
+
+// The number of hub-review/state entries right now (the pre-command baseline).
+function readReviewStateIndex(cb) {
+  readReviewState((_state, index) => cb(index));
 }
 
 function readPlanState(cb) {
@@ -425,8 +446,12 @@ function readPlanState(cb) {
     .catch(() => cb(null));
 }
 
-function writeActivePreset(cwd, presetId) {
-  const definitionsPath = path.join(cwd, '.pi', 'agent-presets.json');
+function writeActivePreset(presetId) {
+  // Write into the hub-owned harness dir (NOT the user workspace): that path is
+  // what the extension reads via AGENT_PRESETS_CONFIG.
+  const base = process.env.AGENT_HUB_HARNESS_DIR;
+  if (!base) return null;
+  const definitionsPath = path.join(base, 'agent-presets.json');
   const cfg = { active: presetId || null, presets: {} };
   if (presetId && PRESETS_DIR) {
     const src = path.join(PRESETS_DIR, `${presetId}.json`);
@@ -461,47 +486,63 @@ function modelDecl(id) { return injectedFacts.find((m) => m && m.id === id) || n
   // to the wrong model and silently loses capabilities (images). Keep it slash-free.
 const INJECT_PREFIX = 'hub-';
 
-function probeModels(url, value) {
+// WHERE a provider's model list lives is a property of the DIALECT it speaks, not
+// something to assume. An OpenAI-compatible endpoint serves GET <base>/models; an
+// Anthropic-messages endpoint (the Anthropic SDK the harness uses) serves GET
+// <base>/v1/models, because its baseURL is the host root and the SDK appends /v1.
+// Try the dialect's path FIRST, then the other, and only fail when neither answers.
+function modelsPathsFor(api, base) {
+  const openai = base + '/models';
+  const anthropic = base + '/v1/models';
+  if (api === 'anthropic-messages') return [anthropic, openai];
+  return [openai, anthropic];
+}
+
+function fetchModelsOnce(mod, u, base, value) {
   return new Promise((resolve, reject) => {
-    let u;
-    try { u = new URL(url); } catch (e) { return reject(new Error('invalid provider url: ' + url)); }
-    const mod = u.protocol === 'https:' ? require('https') : require('http');
-    const base = u.pathname.replace(/\/$/, '');
-    const req = mod.request({ method: 'GET', hostname: u.hostname, port: u.port || undefined, path: base + '/models', headers: { authorization: 'Bearer ' + value }, timeout: 15000 }, (res2) => {
+    const req = mod.request({ method: 'GET', hostname: u.hostname, port: u.port || undefined, path: base, headers: { authorization: 'Bearer ' + value }, timeout: 15000 }, (res2) => {
       let b = '';
       res2.setEncoding('utf8');
       res2.on('data', (d) => { b += d; });
       res2.on('end', () => {
-        if (res2.statusCode < 200 || res2.statusCode >= 300) return reject(new Error(`provider ${url} /models -> ${res2.statusCode}`));
-        let j; try { j = JSON.parse(b); } catch { return reject(new Error('provider /models is not JSON')); }
+        if (res2.statusCode < 200 || res2.statusCode >= 300) return reject(new Error(`${base} -> ${res2.statusCode}`));
+        let j; try { j = JSON.parse(b); } catch { return reject(new Error(`${base} is not JSON`)); }
         const list = Array.isArray(j.data) ? j.data : Array.isArray(j.models) ? j.models : null;
-        if (!list) return reject(new Error('provider /models has no model array'));
+        if (!list) return reject(new Error(`${base} has no model array`));
         resolve(list.map((m) => (typeof m === 'string' ? m : m.id)).filter(Boolean));
       });
     });
-    req.on('timeout', () => req.destroy(new Error('provider /models timed out')));
+    req.on('timeout', () => req.destroy(new Error(`${base} timed out`)));
     req.on('error', reject);
     req.end();
   });
 }
 
-// Build a private JOUZU_HOME carrying the user's own agent config forward plus
-// the injected provider. jouzu owns PI_CODING_AGENT_DIR: `configurePiProcess`
-// overwrites it with `paths.agentDir` on every start, so an adapter that sets it
-// is silently ignored and the harness runs on its native providers. The only
-// lever jouzu honours is its own root (`JOUZU_HOME` / `--jouzu-home`), whose
-// agent dir IS `paths.agentDir` (docs/windows.md, paths.ts).
+function probeModels(url, value, api) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try { u = new URL(url); } catch (e) { return reject(new Error('invalid provider url: ' + url)); }
+    const mod = u.protocol === 'https:' ? require('https') : require('http');
+    const base = u.pathname.replace(/\/$/, '');
+    const paths = modelsPathsFor(api, base);
+    let lastErr = null;
+    const attempt = (i) => {
+      if (i >= paths.length) return reject(new Error(`provider ${url} models: ${lastErr ? lastErr.message : 'no path answered'}`));
+      fetchModelsOnce(mod, u, paths[i], value).then(resolve, (e) => { lastErr = e; attempt(i + 1); });
+    };
+    attempt(0);
+  });
+}
+
+// The hub-managed provider is injected into jouzu's ONE root - the harness dir the
+// hub gave us (AGENT_HUB_HARNESS_DIR), which every session of this harness shares.
+// jouzu owns PI_CODING_AGENT_DIR: `configurePiProcess` overwrites it from its own
+// root on every start, so the only lever is that root itself, whose agent dir IS
+// `paths.agentDir` (docs/windows.md, paths.ts). The provider goes into ITS
+// agent/models.json - the hub-owned harness dir, so the user's real files are never
+// touched.
 function buildInjectedDir() {
-  const base = jouzuAgentDir();
-  const root = path.join(SESSIONS_DIR, 'injected-' + (granted.connectionId || 'provider').replace(/[^A-Za-z0-9_.-]/g, '_'));
-  const dir = path.join(root, 'agent');
-  fs.mkdirSync(dir, { recursive: true });
-  // Carry the user's own config forward, verbatim; never mutate the originals.
-  for (const f of ['models.json', 'auth.json', 'models-store.json', 'settings.json']) {
-    const src = path.join(base, f);
-    if (fs.existsSync(src)) fs.copyFileSync(src, path.join(dir, f));
-  }
-  return root;
+  return process.env.JOUZU_HOME;
 }
 
 // Add the injected provider into the private AGENT dir's models.json. apiKey is
@@ -516,7 +557,9 @@ function thinkingLevelMapFor(decl) {
 }
 
 function applyInjectedProvider(dir, modelIds) {
-  const p = path.join(dir, 'agent', 'models.json');
+  const agentDir = path.join(dir, 'agent');
+  fs.mkdirSync(agentDir, { recursive: true });
+  const p = path.join(agentDir, 'models.json');
   const cfg = readJsonFile(p) || {};
   cfg.providers = cfg.providers || {};
   const pid = INJECT_PREFIX + String(granted.connectionId || 'provider');
@@ -540,43 +583,81 @@ function applyInjectedProvider(dir, modelIds) {
   fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
 }
 
+// The hub-owned jouzu profile must be applied ONCE, before sessions start. jouzu
+// re-runs the apply on EVERY launch; when several sessions of one harness start at
+// the same instant, they race the same `profile.lock`, and the losers exit 1
+// ("another profile operation is in progress") - a harness must serve many sessions
+// at once (docs/issues/20261005-030000). So apply it ONCE here, before the first
+// spawn, and let every launch find it converged (a converged apply takes no lock).
+// A bounded retry covers the case where another launch is mid-apply right now.
+function ensureProfileApplied() {
+  if (profileApplied) return;
+  profileApplied = true;   // once per adapter process
+  const r = piRuntime || resolvePi();
+  const argv = [r.cmd, ...r.args, 'profile', 'apply'];   // e.g. [node, .../dist/cli.js, profile, apply]
+  const t0 = Date.now();
+  for (;;) {
+    const p = spawnSync(argv[0], argv.slice(1), {
+      windowsHide: true, encoding: 'utf8',
+      env: { ...process.env },   // carries JOUZU_HOME
+    });
+    const out = (p.stdout || '') + String.fromCharCode(10) + (p.stderr || '');
+    // Converged (or applied) is success; a busy lock is retried briefly.
+    if (p.status === 0 || /already converged|Applied transaction/i.test(out)) return;
+    if (/another profile operation is in progress/i.test(out) && Date.now() - t0 < 15000) {
+      continue;
+    }
+    // Never block a start on this: log and let the launch proceed (it will apply
+    // itself, which is the old behaviour).
+    process.stderr.write('[jouzu-adapter] profile apply did not converge: ' + out.trim().slice(0, 300) + String.fromCharCode(10));
+    return;
+  }
+}
+let profileApplied = false;
+
 function startPi(resumeRef) {
   if (!SESSIONS_DIR) {
     die('AGENT_HUB_HARNESS_DIR not set: the core must provide a data dir; refusing to write runtime data next to plugin code');
   }
   fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+  ensureProfileApplied();
   const ref = resumeRef || path.join(SESSIONS_DIR, `session-${Date.now()}-${process.pid}.jsonl`);
   // The harness initializes an explicitly supplied empty file with its own
   // valid header and persists subsequent entries even before a model turn.
   // Never create a file on resume: missing existing references must fail.
   if (!resumeRef) fs.closeSync(fs.openSync(ref, 'wx'));
 
-  const args = [...piRuntime.args, 'pi', '--mode', 'rpc', '--session', ref, '--session-dir', SESSIONS_DIR, '--approve'];
+  // Extensions and skills are HUB-OWNED resources: the hub installed them into its
+  // data dir and handed the paths over. The adapter points jouzu at those dirs with
+  // discovery OFF - it never copies them into the user's project dir and never
+  // trusts the project to load them:
+  //   --no-extensions  turns off the harness's own (discovered/configured/built-in)
+  //                    load, so a managed session loads ONLY the hub's extensions;
+  //   --extension <d>  adds each hub extension back (explicit, additive).
+  // Same shape the skills path already uses (--no-skills --skill <dir>).
+  const args = [...piRuntime.args, 'pi', '--mode', 'rpc', '--session', ref, '--session-dir', SESSIONS_DIR];
+  const presetsExtDir = extensionDirFor('agent-presets');
+  const planExtDir = extensionDirFor('plan');
+  if (presetsExtDir || planExtDir) args.push('--no-extensions');
+  if (presetsExtDir) args.push('--extension', presetsExtDir);
+  if (planExtDir) args.push('--extension', planExtDir);
   // Skills: the hub installs them and hands over the directory; --no-skills turns
   // off the harness's own discovery so the user's own skill directories stay out of
   // a managed session, and --skill adds the hub's directory (additive either way).
   if (process.env.AGENT_HUB_INSTALLED_SKILLS_DIR) args.push('--no-skills', '--skill', process.env.AGENT_HUB_INSTALLED_SKILLS_DIR);
   const env = { ...process.env };
-  // A session preset: install the agent-presets extension into the workspace
-  // and hand it the definition file it reads.
-  // Place only the extension the hub installed, before the child discovers it.
-  if (process.env.AGENT_HUB_CWD) installAgentPresetsExt(process.env.AGENT_HUB_CWD);
+  // A session preset: hand the extension the definition file it reads. The file
+  // lives in the hub-owned harness dir, NOT the user workspace.
   if (activePresetId !== null) {
-    const wcwd = process.env.AGENT_HUB_CWD || undefined;
-    if (wcwd) { installAgentPresetsExt(wcwd); env.AGENT_PRESETS_CONFIG = writeActivePreset(wcwd, activePresetId); }
+    env.AGENT_PRESETS_CONFIG = writeActivePreset(activePresetId);
   }
-  // Plan mode's extension travels with the session's workspace too, so a
-  // `/plan` from the core has something to run against.
-  if (process.env.AGENT_HUB_CWD) installPlanExt(process.env.AGENT_HUB_CWD);
-  // J-2: inject the hub-managed provider by giving jouzu a private JOUZU_HOME.
-  // jouzu rewrites PI_CODING_AGENT_DIR from its own root on start, so the
-  // injected models.json only takes effect through JOUZU_HOME. The token rides
-  // in the env; the models.json entry references it as ${ENV}.
+  // J-2: inject the hub-managed provider into the harness's ONE root (its
+  // agent/models.json). The token rides in the env; the models.json entry
+  // references it as ${ENV}. No extra home is created.
   if (granted && granted.url && granted.value) {
     if (!injectedEnvName) injectedEnvName = 'AGENT_HUB_INJECTED_' + String(granted.connectionId || 'PROVIDER').replace(/[^A-Za-z0-9]/g, '_').toUpperCase() + '_API_KEY';
     env[injectedEnvName] = granted.value;
     injectedDir = injectedDir || buildInjectedDir();
-    env.JOUZU_HOME = injectedDir;
   }
   // Run jouzu in the user project dir (AGENT_HUB_CWD) so tools act on the project.
   const cwd = process.env.AGENT_HUB_CWD || undefined;
@@ -852,7 +933,7 @@ function handlePiMessage(msg) {
     terminalSent = true;
     lastStopReason = undefined;
     turnsRun += 1;
-    send({ jsonrpc: '2.0', method: 'event', params: { sid, data: { type: 'turn_end', status } } });
+    send({ jsonrpc: '2.0', method: 'event', params: { sid, data: { type: 'turn_end', clientMessageId: currentClientMessageId, state: status === 'completed' ? 'ok' : status, status } } });
     // The plan extension can change plan mode on its own — the model leaves
     // plan mode when its plan is approved. Read the state back and report the
     // change, so the core's view follows the harness rather than the last thing
@@ -898,6 +979,12 @@ let abortRequested = false;
 let terminalSent = false; // true once we reported a terminal turn_end for the current turn
 let turnActive = false;  // true from prompt start until we report a terminal
 let lastStopReason;     // last turn_end stopReason seen in the active turn
+// The clientMessageId (the core's turn id) of the turn in flight. The core binds a
+// turn's terminal by THIS id on the `turn_end` event, so every turn_end must echo it
+// (the core's pump matches on `clientMessageId`; without it the terminal is never
+// bound and the turn settles `failed` on the core's timeout - the pi adapter sends
+// it, so jouzu must too).
+let currentClientMessageId;
 
 // How many turns this session has produced. A preset is a session composition
 // — swapping tools under a conversation leaves logged tool calls the new
@@ -1051,11 +1138,13 @@ function handleBusMessage(msg) {
           const response = await piRequest({ type: 'prompt', message: params.message });
           if (!response?.success) throw new Error(JSON.stringify(response?.error ?? 'native control failed'));
           // Completion means the control handler returned, not that a model ran.
-          send({ jsonrpc: '2.0', method: 'event', params: { sid, data: { type: 'turn_end', status: 'ok' } } });
+          send({ jsonrpc: '2.0', method: 'event', params: { sid, data: { type: 'turn_end', clientMessageId: params.clientMessageId, state: 'ok', status: 'ok' } } });
           send({ jsonrpc: '2.0', id, result: {} });
         })().catch(error => send({ jsonrpc: '2.0', id, error: { code: -32000, message: error.message } }));
         return;
       }
+      // This turn's id: echoed on its terminal turn_end so the core can bind it.
+      currentClientMessageId = params.clientMessageId;
       appendTranscript({ id: params.clientMessageId, role: 'user', source: params.source || 'user', text: params.message, complete: true });
       // Do NOT arm the new turn yet: a stale turn_end from a just-aborted turn
       // can still arrive. pi cannot emit the new turn's turn_end before it
@@ -1115,7 +1204,7 @@ function handleBusMessage(msg) {
         // name must be fixed before we reference it in models.json.
         injectedEnvName = 'AGENT_HUB_INJECTED_' + String(granted.connectionId || 'PROVIDER').replace(/[^A-Za-z0-9]/g, '_').toUpperCase() + '_API_KEY';
         injectedDir = buildInjectedDir();
-        probeModels(granted.url, granted.value).then((models) => {
+        probeModels(granted.url, granted.value, granted.api).then((models) => {
           injectedModels = models;
           applyInjectedProvider(injectedDir, models);
           // The injected agent dir + token env only reach pi at SPAWN, and pi
@@ -1182,6 +1271,14 @@ function handleBusMessage(msg) {
           if (state?.success !== true) throw new Error('cannot read effective configuration');
           const actual = state.data;
           if (actual.model) { applied.model = actual.model.id; applied.connectionId = actual.model.provider; }
+          // A HUB-INJECTED provider must be reported by BOTH identities, exactly
+          // as config/set does (adapter-v1): applied.modelProviderId is the hub's
+          // provider id, applied.connectionId is its RESOLVED NATIVE ROUTE
+          // (`hub-<id>`). Without this the core refuses an unconfirmed identity.
+          if (granted && granted.url && granted.value && granted.connectionId) {
+            applied.modelProviderId = granted.connectionId;
+            applied.connectionId = INJECT_PREFIX + granted.connectionId;
+          }
           applied.thinkingLevel = typeof actual.thinkingLevel === 'string' ? actual.thinkingLevel : null;
           return piRequest({ type: 'get_entries' });
         }).then(result => {
@@ -1190,7 +1287,12 @@ function handleBusMessage(msg) {
           const planEntry = entries.filter(e => e.customType === 'plan/mode').at(-1);
           const reviewEntry = entries.filter(e => e.customType === 'hub-review/state').at(-1);
           if (typeof planEntry?.data?.active === 'boolean') applied.plan = planEntry.data.active;
-          if (typeof reviewEntry?.data?.asking === 'boolean') applied.review = reviewEntry.data.asking;
+          // Only take the LOG's value when this request did not ask to change review.
+          // When it did, `reviewCommand` already OBSERVED the switch take effect (a NEW
+          // state entry); clobbering it here with `.at(-1)` would re-introduce the race
+          // this whole path exists to close (20261004-070000: a log record read as the
+          // live gate).
+          if (review === undefined && typeof reviewEntry?.data?.asking === 'boolean') applied.review = reviewEntry.data.asking;
           reply({ jsonrpc: '2.0', id, result: { applied, requires: 'none' } });
         }).catch(error => reply({ jsonrpc: '2.0', id, error: { code: -32000, message: error.message } }));
       };
@@ -1239,7 +1341,6 @@ function handleBusMessage(msg) {
             reply({ jsonrpc: '2.0', id, error: { code: -32000, message: 'cannot apply preset: no live harness to carry it' } });
             return;
           }
-          if (cwd) { installAgentPresetsExt(cwd); writeActivePreset(cwd, presetId || null); }
           // Record the choice BEFORE respawning: startPi reads activePresetId to
           // hand the child its AGENT_PRESETS_CONFIG, so a restart that ran first
           // would spawn a pi with no preset — the silent no-op this guards.
@@ -1254,9 +1355,9 @@ function handleBusMessage(msg) {
       if (plan !== undefined) {
         // Plan mode is a session-scoped capability, not a composition: toggle it
         // through the extension's own command and read the state back from the
-        // log it writes. No restart — the harness owns the state from here.
-        const cwd = process.env.AGENT_HUB_CWD;
-        if (cwd) installPlanExt(cwd);
+        // log it writes. No restart — the harness owns the state from here. The
+        // plan extension was already loaded at spawn (--extension); a harness the
+        // hub did not install it for simply has no command and reports unapplied.
         pendingCount += 1;
         planCommand(plan === true, (state) => {
           if (state !== null && state !== undefined) { applied.plan = state; planActive = state; }
@@ -1266,10 +1367,9 @@ function handleBusMessage(msg) {
 
       if (review !== undefined) {
         // The review switch is the preset extension's own state. Drive its
-        // command and read the log back; installed so a mid-session switch has
-        // something to run against.
-        const rcwd = process.env.AGENT_HUB_CWD;
-        if (rcwd) installAgentPresetsExt(rcwd);
+        // command and read the log back. The agent-presets extension was loaded
+        // at spawn (--extension); a harness the hub did not install it for has
+        // no /review command and the switch reports unapplied.
         pendingCount += 1;
         reviewCommand(review === true, (state, error) => {
           if (error) { reply({ jsonrpc: '2.0', id, error: { code: -32000, message: error.message, data: { code: 'review-not-applied' } } }); return; }
